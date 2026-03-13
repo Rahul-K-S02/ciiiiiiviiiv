@@ -39,6 +39,7 @@ import {
 } from './firebase';
 import { UserProfile, Incident, IncidentType, IncidentPriority } from './types';
 import { GeminiVoiceService } from './services/geminiVoiceService';
+import { ImageMatchingService } from './services/imageMatchingService';
 import { AudioPlayer } from './utils/audioPlayer';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -93,7 +94,16 @@ export default function App() {
   const [transcripts, setTranscripts] = useState<{ text: string, isUser: boolean }[]>([]);
   const [currentView, setCurrentView] = useState<'home' | 'report' | 'map' | 'dashboard'>('home');
   
+  const [hasProof, setHasProof] = useState(false);
+  const [isProofModalOpen, setIsProofModalOpen] = useState(false);
+  const [isMatching, setIsMatching] = useState(false);
+  const [matchResult, setMatchResult] = useState<{ isMatch: boolean; reason: string } | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [detectedIncidentType, setDetectedIncidentType] = useState<IncidentType | null>(null);
+  
   const voiceService = useRef<GeminiVoiceService | null>(null);
+  const matchingService = useRef<ImageMatchingService | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const audioPlayer = useRef<AudioPlayer | null>(null);
 
   // Initialize Auth
@@ -188,7 +198,14 @@ export default function App() {
         setStatus('Error');
         console.error(err);
       },
-      onStatusChange: (s) => setStatus(s)
+      onStatusChange: (s) => setStatus(s),
+      onProofRequested: () => {
+        setIsProofModalOpen(true);
+        setTranscripts(prev => [...prev, { text: "System: AI Agent is requesting photographic proof.", isUser: false }]);
+      },
+      onIncidentTypeDetected: (type) => {
+        setDetectedIncidentType(type);
+      }
     }, location);
   };
 
@@ -197,7 +214,63 @@ export default function App() {
     audioPlayer.current?.stop();
     setIsCalling(false);
     setStatus('Idle');
+    setHasProof(false);
+    setIsProofModalOpen(false);
+    setMatchResult(null);
+    setIsMatching(false);
+    setDetectedIncidentType(null);
   };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsMatching(true);
+    setMatchResult(null);
+
+    if (!matchingService.current) matchingService.current = new ImageMatchingService();
+
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64 = reader.result as string;
+      const result = await matchingService.current!.matchImageToIncidents(base64, incidents);
+      
+      setIsMatching(false);
+      setMatchResult(result);
+      
+      if (!result.isMatch) {
+        setHasProof(true);
+        setIsProofModalOpen(false);
+        if (isCalling) {
+          setTranscripts(prev => [...prev, { text: "System: Photo analyzed. No duplicates found. Proceeding...", isUser: false }]);
+          voiceService.current?.confirmProof();
+        }
+      } else {
+        if (isCalling) {
+          setTranscripts(prev => [...prev, { text: `System: Potential duplicate detected! ${result.reason}`, isUser: false }]);
+        }
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const toggleProof = () => {
+    if (hasProof) {
+      setHasProof(false);
+      setMatchResult(null);
+    } else {
+      fileInputRef.current?.click();
+    }
+  };
+
+  const filteredIncidents = useMemo(() => {
+    if (!searchQuery.trim()) return incidents;
+    const query = searchQuery.toLowerCase();
+    return incidents.filter(inc => 
+      inc.type.toLowerCase().includes(query) || 
+      inc.description.toLowerCase().includes(query)
+    );
+  }, [incidents, searchQuery]);
 
   if (loading) {
     return (
@@ -236,7 +309,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
-      <div className="min-h-screen bg-brand-bg flex flex-col overflow-hidden text-white">
+      <div className="h-screen bg-brand-bg flex flex-col overflow-hidden text-white">
         
         {/* Top Navigation Bar */}
         <nav className="h-20 border-b border-brand-border bg-brand-card/80 backdrop-blur-xl flex items-center justify-between px-6 z-50">
@@ -293,9 +366,9 @@ export default function App() {
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 1.05 }}
-                className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center"
+                className="absolute inset-0 flex flex-col items-center p-6 text-center overflow-y-auto"
               >
-                <div className="max-w-3xl">
+                <div className="max-w-3xl my-auto py-12">
                   <motion.div
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -356,9 +429,9 @@ export default function App() {
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
-                className="absolute inset-0 flex flex-col items-center justify-center p-6"
+                className="absolute inset-0 flex flex-col items-center p-6 overflow-y-auto"
               >
-                <div className="max-w-2xl w-full flex flex-col items-center">
+                <div className="max-w-2xl w-full flex flex-col items-center py-8">
                   <motion.div 
                     animate={{ opacity: [0.5, 1, 0.5] }}
                     transition={{ duration: 2, repeat: Infinity }}
@@ -400,7 +473,79 @@ export default function App() {
                     {isCalling ? "Talk naturally to report an issue. I'm here to help." : "Click the button to start reporting with your voice."}
                   </p>
 
-                  <div className="w-full h-64 glass-morphism rounded-3xl p-6 overflow-y-auto space-y-4">
+                  <AnimatePresence>
+                    {isCalling && detectedIncidentType && ['fire', 'medical_emergency', 'police_emergency'].includes(detectedIncidentType) && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        className="w-full mb-8 p-6 bg-red-500/10 border-2 border-red-500/50 rounded-3xl overflow-hidden relative"
+                      >
+                        <div className="absolute top-0 right-0 p-4 opacity-10">
+                          <AlertTriangle className="w-24 h-24 text-red-500" />
+                        </div>
+                        
+                        <div className="flex items-center gap-4 mb-4">
+                          <div className="p-3 bg-red-500 rounded-2xl text-white animate-pulse">
+                            <Shield className="w-8 h-8" />
+                          </div>
+                          <div>
+                            <h3 className="text-xl font-bold text-red-500 uppercase tracking-tighter">EMERGENCY PROTOCOL ACTIVE</h3>
+                            <p className="text-xs text-gray-400 font-mono">TYPE: {detectedIncidentType.replace('_', ' ').toUpperCase()}</p>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                          <div className="space-y-3">
+                            <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">First Aid / Safety</p>
+                            <ul className="text-sm space-y-2">
+                              {detectedIncidentType === 'fire' && (
+                                <>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Evacuate immediately</li>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Stay low to avoid smoke</li>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Do not use elevators</li>
+                                </>
+                              )}
+                              {detectedIncidentType === 'medical_emergency' && (
+                                <>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Keep the person still</li>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Check for breathing</li>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Apply pressure to wounds</li>
+                                </>
+                              )}
+                              {detectedIncidentType === 'police_emergency' && (
+                                <>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Stay in a safe location</li>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Avoid confrontation</li>
+                                  <li className="flex gap-2"><div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5 shrink-0" /> Lock all doors/entries</li>
+                                </>
+                              )}
+                            </ul>
+                          </div>
+                          
+                          <div className="space-y-3">
+                            <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">Direct Contacts</p>
+                            <div className="grid grid-cols-1 gap-2">
+                              <a href="tel:101" className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/10 hover:bg-white/10 transition-colors">
+                                <span className="text-sm font-bold">FIRE STATION</span>
+                                <span className="text-brand-primary font-mono">101</span>
+                              </a>
+                              <a href="tel:102" className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/10 hover:bg-white/10 transition-colors">
+                                <span className="text-sm font-bold">AMBULANCE</span>
+                                <span className="text-brand-primary font-mono:">102</span>
+                              </a>
+                              <a href="tel:100" className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/10 hover:bg-white/10 transition-colors">
+                                <span className="text-sm font-bold">POLICE</span>
+                                <span className="text-brand-primary font-mono">100</span>
+                              </a>
+                            </div>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  <div className="w-full h-64 glass-morphism rounded-3xl p-6 overflow-y-auto space-y-4 mb-6">
                     {transcripts.length === 0 && (
                       <div className="h-full flex flex-col items-center justify-center text-gray-600 italic">
                         <Mic className="w-8 h-8 mb-2 opacity-20" />
@@ -416,6 +561,113 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+
+                  {/* Proof Upload Simulation */}
+                  <div className={cn(
+                    "w-full flex items-center justify-between p-4 glass-morphism rounded-2xl border-white/5 transition-all duration-500",
+                    isProofModalOpen ? "ring-2 ring-brand-primary bg-brand-primary/5" : ""
+                  )}>
+                    <div className="flex items-center gap-3">
+                      <div className={cn(
+                        "w-10 h-10 rounded-xl flex items-center justify-center", 
+                        hasProof ? "bg-brand-primary/20 text-brand-primary" : 
+                        isProofModalOpen ? "bg-brand-primary/40 text-brand-primary animate-pulse" : "bg-white/5 text-gray-500"
+                      )}>
+                        <CheckCircle className="w-6 h-6" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-bold">
+                          {hasProof ? "Proof Attached" : isProofModalOpen ? "Awaiting Proof..." : "No Proof Provided"}
+                        </p>
+                        <p className="text-[10px] text-gray-500 uppercase">Required for non-emergencies</p>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={toggleProof}
+                      disabled={isMatching}
+                      className={cn(
+                        "px-4 py-2 rounded-lg text-xs font-bold transition-all",
+                        isMatching ? "bg-gray-700 text-gray-400 cursor-not-allowed" :
+                        hasProof ? "bg-red-500/20 text-red-500 hover:bg-red-500/30" : "bg-brand-primary text-black hover:opacity-90"
+                      )}
+                    >
+                      {isMatching ? "Analyzing..." : hasProof ? "Remove Proof" : "Upload Image"}
+                    </button>
+                    <input 
+                      type="file" 
+                      ref={fileInputRef} 
+                      onChange={handleFileUpload} 
+                      className="hidden" 
+                      accept="image/*" 
+                    />
+                  </div>
+
+                  <AnimatePresence>
+                    {matchResult && matchResult.isMatch && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        className="mt-4 p-4 bg-red-500/10 border border-red-500/30 rounded-2xl"
+                      >
+                        <div className="flex items-center gap-3 mb-2">
+                          <AlertTriangle className="w-5 h-5 text-red-500" />
+                          <p className="text-sm font-bold text-red-500">DUPLICATE DETECTED</p>
+                        </div>
+                        <p className="text-xs text-gray-400">{matchResult.reason}</p>
+                        <div className="mt-4 flex gap-2">
+                          <button 
+                            onClick={() => setMatchResult(null)}
+                            className="px-3 py-1.5 bg-white/10 rounded-lg text-[10px] font-bold"
+                          >
+                            REPORT ANYWAY
+                          </button>
+                          <button 
+                            onClick={endCall}
+                            className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-[10px] font-bold"
+                          >
+                            CANCEL REPORT
+                          </button>
+                        </div>
+                      </motion.div>
+                    )}
+
+                    {isMatching && (
+                      <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="mt-4 p-4 glass-morphism rounded-2xl flex items-center gap-4 border-brand-primary/30"
+                      >
+                        <Activity className="w-5 h-5 text-brand-primary animate-spin" />
+                        <div>
+                          <p className="text-sm font-bold text-brand-primary">AI MATCHING IN PROGRESS</p>
+                          <p className="text-[10px] text-gray-400">Comparing your photo with existing city reports...</p>
+                        </div>
+                      </motion.div>
+                    )}
+
+                    {isProofModalOpen && !hasProof && !isMatching && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 10 }}
+                        className="mt-4 p-4 bg-brand-primary/20 border border-brand-primary/30 rounded-2xl flex items-center gap-4"
+                      >
+                        <div className="p-2 bg-brand-primary rounded-lg text-black">
+                          <Activity className="w-5 h-5 animate-spin" />
+                        </div>
+                        <div className="flex-1">
+                          <p className="text-sm font-bold text-brand-primary">AI REQUEST: ATTACH PHOTO</p>
+                          <p className="text-[10px] text-gray-400">The agent needs visual evidence to proceed with your non-emergency report.</p>
+                        </div>
+                        <button 
+                          onClick={toggleProof}
+                          className="px-4 py-2 bg-brand-primary text-black text-xs font-bold rounded-lg"
+                        >
+                          ATTACH NOW
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </div>
               </motion.div>
             )}
@@ -549,21 +801,36 @@ export default function App() {
                     <div className="flex items-center gap-4">
                       <div className="px-4 py-2 glass-morphism rounded-xl flex items-center gap-2">
                         <Search className="w-4 h-4 text-gray-500" />
-                        <input type="text" placeholder="Search reports..." className="bg-transparent border-none outline-none text-sm" />
+                        <input 
+                          type="text" 
+                          placeholder="Search reports..." 
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          className="bg-transparent border-none outline-none text-sm text-white placeholder:text-gray-600" 
+                        />
                       </div>
                     </div>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {incidents.map((incident) => (
-                      <motion.div 
-                        layout
-                        key={incident.id}
-                        className="p-6 rounded-3xl glass-morphism border-white/5 hover:border-brand-primary/30 transition-all group"
-                      >
+                    {filteredIncidents.length === 0 ? (
+                      <div className="col-span-full py-20 text-center">
+                        <Search className="w-12 h-12 text-gray-700 mx-auto mb-4" />
+                        <p className="text-gray-500">No reports match your search criteria.</p>
+                      </div>
+                    ) : (
+                      filteredIncidents.map((incident) => (
+                        <motion.div 
+                          layout
+                          key={incident.id}
+                          initial={{ opacity: 0, scale: 0.9 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          className="p-6 rounded-3xl glass-morphism border-white/5 hover:border-brand-primary/30 transition-all group"
+                        >
                         <div className="flex items-start justify-between mb-4">
                           <div className={cn(
                             "p-3 rounded-xl",
+                            ['fire', 'medical_emergency', 'police_emergency'].includes(incident.type) ? "bg-red-500/20 text-red-500" :
                             incident.type === 'road_damage' ? "bg-orange-500/20 text-orange-500" :
                             incident.type === 'electrical' ? "bg-yellow-500/20 text-yellow-500" :
                             "bg-blue-500/20 text-blue-500"
@@ -582,12 +849,26 @@ export default function App() {
                         
                         <div className="space-y-3 mb-6">
                           <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-500">Proof</span>
+                            <span className={cn("font-bold uppercase", incident.hasProof ? "text-brand-primary" : "text-red-500")}>
+                              {incident.hasProof ? 'Verified' : 'None'}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs">
                             <span className="text-gray-500">Status</span>
                             <span className="text-brand-primary uppercase font-bold">{incident.status}</span>
                           </div>
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="text-gray-500">ETA</span>
-                            <span className="text-white">{incident.eta || 'Calculating...'}</span>
+                          <div className="flex items-center justify-between text-xs p-2 bg-white/5 rounded-lg border border-white/5">
+                            <div className="flex items-center gap-2 text-gray-500">
+                              <Clock className="w-3 h-3" />
+                              <span>ETA</span>
+                            </div>
+                            <span className={cn(
+                              "font-bold font-mono",
+                              incident.eta?.includes('Immediate') ? "text-red-500 animate-pulse" : "text-white"
+                            )}>
+                              {incident.eta || 'Calculating...'}
+                            </span>
                           </div>
                         </div>
 
@@ -601,8 +882,9 @@ export default function App() {
                           <span className="text-[10px] text-gray-500">{new Date(incident.createdAt).toLocaleDateString()}</span>
                         </div>
                       </motion.div>
-                    ))}
-                  </div>
+                    ))
+                  )}
+                </div>
                 </div>
               </motion.div>
             )}

@@ -1,4 +1,4 @@
-export type IncidentType = 'road_damage' | 'electrical' | 'water_supply' | 'sanitation' | 'other';
+export type IncidentType = 'road_damage' | 'electrical' | 'water_supply' | 'sanitation' | 'fire' | 'medical_emergency' | 'police_emergency' | 'other';
 export type IncidentStatus = 'reported' | 'verified' | 'in_progress' | 'resolved';
 export type IncidentPriority = 'low' | 'medium' | 'high' | 'critical';
 
@@ -28,6 +28,7 @@ export interface Incident {
   createdAt: string;
   eta?: string;
   imageUrl?: string;
+  hasProof?: boolean;
 }
 
 export interface VoiceSessionState {

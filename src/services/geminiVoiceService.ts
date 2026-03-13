@@ -11,6 +11,8 @@ export interface VoiceAgentCallbacks {
   onInterrupted: () => void;
   onError: (error: string) => void;
   onStatusChange: (status: string) => void;
+  onProofRequested: () => void;
+  onIncidentTypeDetected: (type: IncidentType) => void;
 }
 
 export class GeminiVoiceService {
@@ -24,6 +26,8 @@ export class GeminiVoiceService {
     this.ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
   }
 
+  private pendingProofCallId: string | null = null;
+
   async connect(callbacks: VoiceAgentCallbacks, userLocation: { lat: number, lng: number, address: string }) {
     try {
       const sessionPromise = this.ai.live.connect({
@@ -34,28 +38,61 @@ export class GeminiVoiceService {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
           systemInstruction: `You are CivicVoice AI, an autonomous smart city assistant. 
-          Your goal is to help residents report infrastructure issues like road damage, water leaks, or electrical problems.
+          Your goal is to help residents report infrastructure issues and handle emergencies.
           
-          Guidelines:
+          CLASSIFICATION:
+          - Emergency: 'fire', 'medical_emergency', 'police_emergency'.
+          - Non-Emergency: 'road_damage', 'electrical', 'water_supply', 'sanitation', 'other'.
+          
+          GUIDELINES:
           1. Be professional, empathetic, and efficient.
-          2. Use the 'reportIncident' tool to create a ticket once you have enough details (type, description).
-          3. Use the 'checkExistingIncidents' tool if the user mentions a common problem to see if it's already reported.
-          4. The user's current location is: ${userLocation.address} (Lat: ${userLocation.lat}, Lng: ${userLocation.lng}).
-          5. If an issue is reported, confirm the ticket creation and provide a simulated ETA.
-          6. Support barge-in: if the user interrupts, stop and listen.
-          7. If you need more info, ask clearly.`,
+          2. FOR NON-EMERGENCY CASES: You MUST ask the user for photographic proof (an image) before registering the complaint. You MUST call the 'requestProof' tool to trigger the upload UI for the user. 
+          3. The 'requestProof' tool will only return a response AFTER the user has successfully attached a photo. Wait for this tool to complete before calling 'reportIncident'.
+          4. FOR EMERGENCY CASES: Process the report IMMEDIATELY. Do NOT ask for proof.
+          5. FOR EMERGENCY CASES: You MUST provide immediate first aid or safety instructions:
+             - Fire: "Evacuate immediately, stay low to the ground to avoid smoke, and do not use elevators."
+             - Medical: "Keep the person still, check for breathing, and apply pressure to any bleeding wounds."
+             - Police: "Stay in a safe location and avoid confrontation."
+          6. FOR EMERGENCY CASES: You MUST provide emergency contact numbers:
+             - Police: 100
+             - Fire Station: 101
+             - Ambulance: 102
+          7. Use the 'reportIncident' tool to create a ticket once requirements are met.
+          8. The user's current location is: ${userLocation.address} (Lat: ${userLocation.lat}, Lng: ${userLocation.lng}).
+          9. Support barge-in: if the user interrupts, stop and listen.
+          10. Use 'identifyIncident' as soon as you are reasonably sure of the category, especially for emergencies.`,
           tools: [
             {
               functionDeclarations: [
                 {
-                  name: "reportIncident",
-                  description: "Reports a new urban incident to the city management system.",
+                  name: "identifyIncident",
+                  description: "Informs the system of the detected incident type early in the conversation.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
                       type: { 
                         type: Type.STRING, 
-                        enum: ["road_damage", "electrical", "water_supply", "sanitation", "other"],
+                        enum: ["road_damage", "electrical", "water_supply", "sanitation", "fire", "medical_emergency", "police_emergency", "other"],
+                        description: "The category of the issue."
+                      }
+                    },
+                    required: ["type"]
+                  }
+                },
+                {
+                  name: "requestProof",
+                  description: "Triggers the photo upload UI. This tool will wait and only return once the user has attached a photo.",
+                  parameters: { type: Type.OBJECT, properties: {} }
+                },
+                {
+                  name: "reportIncident",
+                  description: "Reports a new urban incident or emergency to the city management system.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      type: { 
+                        type: Type.STRING, 
+                        enum: ["road_damage", "electrical", "water_supply", "sanitation", "fire", "medical_emergency", "police_emergency", "other"],
                         description: "The category of the issue."
                       },
                       description: { type: Type.STRING, description: "Detailed description of the problem." },
@@ -63,6 +100,10 @@ export class GeminiVoiceService {
                         type: Type.STRING, 
                         enum: ["low", "medium", "high", "critical"],
                         description: "Urgency of the issue."
+                      },
+                      hasProof: {
+                        type: Type.BOOLEAN,
+                        description: "Whether the user has provided photographic proof (required for non-emergencies)."
                       }
                     },
                     required: ["type", "description", "priority"]
@@ -104,14 +145,26 @@ export class GeminiVoiceService {
               callbacks.onInterrupted();
             }
 
-            if (message.serverContent?.turnComplete) {
-              // Turn finished
-            }
-
             // Handle Tool Calls
             if (message.toolCall) {
               for (const call of message.toolCall.functionCalls) {
-                if (call.name === "reportIncident") {
+                if (call.name === "identifyIncident") {
+                  const args = call.args as { type: IncidentType };
+                  callbacks.onIncidentTypeDetected(args.type);
+                  const session = await sessionPromise;
+                  session.sendToolResponse({
+                    functionResponses: [{
+                      name: "identifyIncident",
+                      id: call.id,
+                      response: { result: "Acknowledged. UI updated with incident-specific information." }
+                    }]
+                  });
+                } else if (call.name === "requestProof") {
+                  this.pendingProofCallId = call.id;
+                  callbacks.onProofRequested();
+                  // We do NOT send the tool response yet. 
+                  // It will be sent when confirmProof() is called.
+                } else if (call.name === "reportIncident") {
                   const result = await this.handleReportIncident(call.args as any, userLocation);
                   const session = await sessionPromise;
                   session.sendToolResponse({
@@ -151,14 +204,35 @@ export class GeminiVoiceService {
     }
   }
 
-  private async handleReportIncident(args: { type: IncidentType, description: string, priority: IncidentPriority }, location: any) {
+  async confirmProof() {
+    if (this.session && this.pendingProofCallId) {
+      await this.session.sendToolResponse({
+        functionResponses: [{
+          name: "requestProof",
+          id: this.pendingProofCallId,
+          response: { result: "Success: User has attached photographic proof." }
+        }]
+      });
+      this.pendingProofCallId = null;
+      return true;
+    }
+    return false;
+  }
+
+  private async handleReportIncident(args: { type: IncidentType, description: string, priority: IncidentPriority, hasProof?: boolean }, location: any) {
     if (!auth.currentUser) return "Error: User not authenticated";
+
+    const isEmergency = ['fire', 'medical_emergency', 'police_emergency'].includes(args.type);
+    
+    if (!isEmergency && !args.hasProof) {
+      return "Error: Photographic proof is required for non-emergency reports. Please provide an image first.";
+    }
 
     try {
       const incidentData = {
         type: args.type,
         description: args.description,
-        priority: args.priority,
+        priority: isEmergency ? 'critical' : args.priority,
         status: "reported",
         location: {
           latitude: location.lat,
@@ -168,11 +242,19 @@ export class GeminiVoiceService {
         reporterUid: auth.currentUser.uid,
         reporterName: auth.currentUser.displayName || "Anonymous",
         createdAt: new Date().toISOString(),
-        eta: this.calculateETA(args.type, args.priority)
+        eta: isEmergency ? "Immediate Response Dispatched" : this.calculateETA(args.type, args.priority),
+        hasProof: !!args.hasProof
       };
 
       const docRef = await addDoc(collection(db, "incidents"), incidentData);
-      return `Success: Incident reported with ID ${docRef.id}. ETA for resolution is ${incidentData.eta}.`;
+      
+      let response = `Success: Incident reported with ID ${docRef.id}.`;
+      if (isEmergency) {
+        response += " EMERGENCY SERVICES HAVE BEEN DISPATCHED IMMEDIATELY.";
+      } else {
+        response += ` ETA for resolution is ${incidentData.eta}.`;
+      }
+      return response;
     } catch (error: any) {
       return `Error: Failed to report incident. ${error.message}`;
     }
@@ -190,6 +272,7 @@ export class GeminiVoiceService {
   }
 
   private calculateETA(type: string, priority: string) {
+    if (['fire', 'medical_emergency', 'police_emergency'].includes(type)) return "Immediate Response Dispatched";
     if (priority === 'critical') return "2-4 hours";
     if (priority === 'high') return "12-24 hours";
     if (type === 'water_supply') return "6 hours";
