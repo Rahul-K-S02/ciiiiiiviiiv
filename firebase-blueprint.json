@@ -1,0 +1,54 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Stores user information and trust score.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "trustScore": { "type": "number", "description": "Score based on reporting accuracy." },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName"]
+    },
+    "Incident": {
+      "title": "Urban Incident",
+      "description": "A reported infrastructure issue.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string", "enum": ["road_damage", "electrical", "water_supply", "sanitation", "other"] },
+        "description": { "type": "string" },
+        "location": {
+          "type": "object",
+          "properties": {
+            "latitude": { "type": "number" },
+            "longitude": { "type": "number" },
+            "address": { "type": "string" }
+          }
+        },
+        "status": { "type": "string", "enum": ["reported", "verified", "in_progress", "resolved"] },
+        "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "reporterUid": { "type": "string" },
+        "reporterName": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "eta": { "type": "string", "description": "Estimated time of resolution" },
+        "imageUrl": { "type": "string" }
+      },
+      "required": ["type", "description", "location", "status", "priority", "reporterUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/incidents/{incidentId}": {
+      "schema": "Incident",
+      "description": "Reported urban incidents"
+    }
+  }
+}

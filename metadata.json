@@ -1,0 +1,8 @@
+{
+  "name": "CivicVoice AI",
+  "description": "Autonomous voice agent for urban incident reporting and smart city management.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ]
+}
